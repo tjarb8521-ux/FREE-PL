@@ -19,6 +19,48 @@ except ImportError:
 WORKDIR = "/home/user/app/server"
 os.makedirs(WORKDIR, exist_ok=True)
 
+
+# ─── مسارات آمنة: منع Path Traversal ───────────────────────
+def is_within_workdir(path: str) -> bool:
+    """Return True if *path* resolves inside WORKDIR."""
+    rp = os.path.realpath(path)
+    wd = os.path.realpath(WORKDIR)
+    return rp == wd or rp.startswith(wd + os.sep)
+
+
+def normalize_relative_path(rel: str) -> str:
+    """Collapse *rel*, strip leading ``/`` and ``..`` components, return safe relative path."""
+    if not rel:
+        return ""
+    parts = [p for p in rel.replace("\\", "/").split("/") if p and p not in (".", "..")]
+    return "/".join(parts)
+
+
+def validate_simple_name(name: str) -> bool:
+    """Return True if *name* contains no path separators or traversal sequences."""
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        return False
+    return True
+
+
+def resolve_safe_child_path(base_rel: str, child_name: str) -> str:
+    """Return absolute path for *child_name* inside *base_rel*, or raise ``ValueError``."""
+    base = os.path.realpath(os.path.join(WORKDIR, normalize_relative_path(base_rel)))
+    if not validate_simple_name(child_name):
+        raise ValueError(f"Invalid name: {child_name!r}")
+    target = os.path.realpath(os.path.join(base, child_name))
+    if not is_within_workdir(target):
+        raise ValueError(f"Path escapes WORKDIR: {child_name!r}")
+    return target
+
+
+def sanitize_upload_name(name: str) -> str:
+    """Strip directory components from an upload filename and validate."""
+    name = os.path.basename(name)
+    if not validate_simple_name(name):
+        raise ValueError(f"Unsafe upload name: {name!r}")
+    return name
+
 log_output = []
 mc_process = None
 
@@ -54,6 +96,61 @@ def get_user_role(username):
 # إذا كان الـ Space عاماً (Public) أو ما فيه OAuth حقيقي، اتركه False دائماً
 # وإلا أي زائر بدون هوية بياخذ صلاحيات كاملة (admin).
 LOCAL_DEV_MODE = False
+
+
+# ─── طلب المستخدم الحالي من الطلب ─────────────────────────
+def resolve_current_user(request: gr.Request) -> str | None:
+    """Extract the authenticated username from a Gradio ``Request`` object.
+
+    Tries ``request.username`` (HF OAuth) then common headers/query params.
+    Returns ``None`` when no identity can be determined.
+    """
+    if request is None:
+        return None
+
+    # Gradio on HF Spaces sets request.username when OAuth is active
+    uname = getattr(request, "username", None)
+    if uname:
+        return uname
+
+    # Fallback: X-Forwarded-User header (reverse-proxy setups)
+    headers = getattr(request, "headers", {}) or {}
+    forwarded = headers.get("x-forwarded-user") or headers.get("x-forwarded-preferred-username")
+    if forwarded:
+        return forwarded
+
+    # Fallback: query parameter ``?user=xxx``
+    query_params = getattr(request, "query_params", {}) or {}
+    qp_user = query_params.get("user")
+    if qp_user:
+        return qp_user
+
+    return None
+
+
+# ─── تهيئة الأدمن الأولي ───────────────────────────────────
+INITIAL_ADMIN_USERNAME = os.environ.get("INITIAL_ADMIN_USERNAME", "").strip()
+ALLOW_FIRST_AUTHENTICATED_ADMIN = os.environ.get("ALLOW_FIRST_AUTHENTICATED_ADMIN", "").lower() in ("1", "true", "yes")
+
+
+def _bootstrap_admin(username: str | None) -> None:
+    """Ensure an initial admin exists in users.json.
+
+    - ``INITIAL_ADMIN_USERNAME``: auto-adds this user as admin on first login.
+    - ``ALLOW_FIRST_AUTHENTICATED_ADMIN``: the first user to authenticate gets admin.
+    """
+    if not username:
+        return
+    users = load_users()
+    if users:
+        return  # at least one user already configured — nothing to do
+    candidate = INITIAL_ADMIN_USERNAME if INITIAL_ADMIN_USERNAME else (
+        username if ALLOW_FIRST_AUTHENTICATED_ADMIN else None
+    )
+    if candidate:
+        users[candidate] = "admin"
+        save_users(users)
+        log(f"[AUTH] Bootstrapped initial admin: {candidate}")
 
 def has_perm(username, perm):
     if username is None:
@@ -283,10 +380,11 @@ async def get_server_status():
 def get_safe_path(rel_path):
     if rel_path is None:
         rel_path = ""
-    abs_path = os.path.abspath(os.path.join(WORKDIR, rel_path))
-    if abs_path.startswith(os.path.abspath(WORKDIR)):
+    rel_path = normalize_relative_path(rel_path)
+    abs_path = os.path.realpath(os.path.join(WORKDIR, rel_path))
+    if is_within_workdir(abs_path):
         return abs_path
-    return WORKDIR
+    return os.path.realpath(WORKDIR)
 
 async def scan_directory(current_rel):
     target_dir = get_safe_path(current_rel)
@@ -372,7 +470,11 @@ async def load_file_content(selected_file, current_rel):
         return empty, title_reset, gr.update(visible=False), gr.update(
             visible=True, value="👈 اختر ملفاً نصياً من القائمة على اليسار ليظهر صندوق التعديل هنا تلقائياً."), "", 0, gr.update(visible=False)
 
-    file_path = os.path.join(get_safe_path(current_rel), selected_file)
+    try:
+        file_path = resolve_safe_child_path(current_rel, selected_file)
+    except ValueError as e:
+        return empty, title_reset, gr.update(visible=False), gr.update(
+            visible=True, value=f"⚠️ {e}"), "", 0, gr.update(visible=False)
 
     if not os.path.isfile(file_path):
         return empty, title_reset, gr.update(visible=False), gr.update(
@@ -434,7 +536,7 @@ async def load_file_content(selected_file, current_rel):
             visible=True, value=f"خطأ أثناء قراءة الملف: {e}"), "", 0, gr.update(visible=False)
 
 async def load_more_content(file_path, load_offset):
-    if not file_path or not os.path.isfile(file_path):
+    if not file_path or not os.path.isfile(file_path) or not is_within_workdir(file_path):
         return gr.update(), 0, gr.update(visible=False)
     
     content = await asyncio.to_thread(
@@ -457,7 +559,10 @@ async def save_file_content(selected_file, content, current_rel, user):
         return "⛔ You don't have `files_write` permission"
     if not selected_file or "لا توجد ملفات" in selected_file:
         return "❌ لم يتم تحديد ملف صالح لحفظه."
-    file_path = os.path.join(get_safe_path(current_rel), selected_file)
+    try:
+        file_path = resolve_safe_child_path(current_rel, selected_file)
+    except ValueError as e:
+        return f"⚠️ {e}"
     try:
         await asyncio.to_thread(
             lambda: open(file_path, "w", encoding="utf-8").write(content)
@@ -471,7 +576,10 @@ async def create_item(name, item_type, current_rel, user):
         return "⛔ You don't have `files_write` permission", *await scan_directory(current_rel)
     if not name:
         return "⚠️ الرجاء إدخال اسم المجلد أو الملف أولاً.", *await scan_directory(current_rel)
-    target_path = os.path.join(get_safe_path(current_rel), name)
+    try:
+        target_path = resolve_safe_child_path(current_rel, name)
+    except ValueError as e:
+        return f"⚠️ {e}", *await scan_directory(current_rel)
     try:
         if "Folder" in item_type or "مجلد" in item_type:
             await asyncio.to_thread(os.makedirs, target_path, exist_ok=True)
@@ -490,8 +598,11 @@ async def rename_item(old_name, new_name, current_rel, user):
         return "⛔ You don't have `files_write` permission", *await scan_directory(current_rel)
     if not old_name or not new_name:
         return "⚠️ حدد العنصر واكتب الاسم الجديد.", *await scan_directory(current_rel)
-    old_p = os.path.join(get_safe_path(current_rel), old_name)
-    new_p = os.path.join(get_safe_path(current_rel), new_name)
+    try:
+        old_p = resolve_safe_child_path(current_rel, old_name)
+        new_p = resolve_safe_child_path(current_rel, new_name)
+    except ValueError as e:
+        return f"⚠️ {e}", *await scan_directory(current_rel)
     try:
         await asyncio.to_thread(os.rename, old_p, new_p)
         return f"✏️ تم إعادة التسمية بنجاح إلى [{new_name}].", *await scan_directory(current_rel)
@@ -503,7 +614,10 @@ async def delete_item(item_name, is_folder, current_rel, user):
         return "⛔ You don't have `files_delete` permission", *await scan_directory(current_rel)
     if not item_name or "لا توجد ملفات" in item_name:
         return "⚠️ لم يتم تحديد عنصر لحذفه.", *await scan_directory(current_rel)
-    target_p = os.path.join(get_safe_path(current_rel), item_name)
+    try:
+        target_p = resolve_safe_child_path(current_rel, item_name)
+    except ValueError as e:
+        return f"⚠️ {e}", *await scan_directory(current_rel)
     try:
         if is_folder:
             await asyncio.to_thread(shutil.rmtree, target_p)
@@ -525,14 +639,18 @@ async def upload_to_current_dir(file_objs, current_rel, user):
     if not isinstance(file_objs, list):
         file_objs = [file_objs]
     for f_obj in file_objs:
-        original_name = getattr(f_obj, 'orig_name', os.path.basename(f_obj.name))
-        await asyncio.to_thread(shutil.copy, f_obj.name, os.path.join(target_dir, original_name))
+        try:
+            original_name = sanitize_upload_name(
+                getattr(f_obj, 'orig_name', os.path.basename(f_obj.name))
+            )
+        except ValueError as e:
+            return f"⚠️ {e}", *await scan_directory(current_rel)
+        dest = os.path.join(target_dir, original_name)
+        if not is_within_workdir(dest):
+            return "⚠️ مسار الرفع خارج WORKDIR!", *await scan_directory(current_rel)
+        await asyncio.to_thread(shutil.copy, f_obj.name, dest)
         uploaded_list.append(original_name)
     return f"✅ تم رفع {len(uploaded_list)} ملفات مباشرة إلى الدليل الحالي ومستعدة للاستخدام!", *await scan_directory(current_rel)
-
-# تشغيل تلقائي للسيرفر في البداية عند بناء الـ Space لأول مرة
-threading.Thread(target=start_server_backend, daemon=True).start()
-
 
 # ────────────────────────────────────────────────────────────
 # CUSTOM HTML DASHBOARD — Pterodactyl/Atom Style
@@ -2147,7 +2265,10 @@ with gr.Blocks(title="MC Server Panel", css="""
             return "ERROR:Permission denied"
         if not filepath:
             return ""
-        target = get_safe_path(os.path.join(rel, filepath) if rel else filepath)
+        try:
+            target = resolve_safe_child_path(rel, filepath)
+        except ValueError:
+            return "ERROR:Invalid path"
         if not os.path.isfile(target):
             return ""
         try:
@@ -2220,7 +2341,14 @@ with gr.Blocks(title="MC Server Panel", css="""
     _b_load_settings.click(fn=w_load_settings, outputs=_settings)
     _b_save_settings.click(fn=w_save_settings, inputs=[_v_settings_data, current_user], outputs=_cmd_result)
 
+    # ─── Auth-aware initialisation ───
+    def w_init_user(request: gr.Request):
+        user = resolve_current_user(request)
+        _bootstrap_admin(user)
+        return user
+
     # ─── Initial loads (one time, no `every`) ───
+    demo.load(fn=w_init_user, inputs=None, outputs=current_user)
     demo.load(fn=get_logs, outputs=_console)
     demo.load(fn=get_server_status, outputs=_status)
     demo.load(fn=w_scan_directory, inputs=current_path_state, outputs=[_path, _folders, _files])
@@ -2229,4 +2357,19 @@ with gr.Blocks(title="MC Server Panel", css="""
 demo.queue(default_concurrency_limit=3)
 log("[SYSTEM] MC Server Panel initialized. Server directory: " + WORKDIR)
 log("[SYSTEM] Use the Console tab → Start Server to launch Minecraft.")
-demo.launch()
+
+
+def main():
+    """Entry-point: optionally auto-start the Minecraft server, then launch Gradio."""
+    log("[SYSTEM] Starting Gradio interface …")
+
+    auto_start = os.environ.get("AUTO_START_SERVER", "").lower() in ("1", "true", "yes")
+    if auto_start:
+        log("[SYSTEM] AUTO_START_SERVER is enabled — launching Minecraft server …")
+        threading.Thread(target=start_server_backend, daemon=True).start()
+
+    demo.launch()
+
+
+if __name__ == "__main__":
+    main()
